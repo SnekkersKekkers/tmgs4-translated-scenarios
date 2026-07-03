@@ -1,0 +1,83 @@
+name: Prune Actions Storage
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifacts_older_than_days:
+        description: "Delete artifacts older than this many days"
+        required: true
+        default: "3"
+      caches_older_than_days:
+        description: "Delete caches older than this many days"
+        required: true
+        default: "7"
+      dry_run:
+        description: "Preview only; do not delete"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  prune:
+    name: Delete old artifacts and caches
+    runs-on: ubuntu-latest
+    env:
+      ARTIFACT_DAYS: ${{ inputs.artifacts_older_than_days }}
+      CACHE_DAYS: ${{ inputs.caches_older_than_days }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Prune old artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cutoff="$(date -u -d "$ARTIFACT_DAYS days ago" +%s)"
+          total=0
+          count=0
+
+          while IFS=$'\t' read -r id name created_at size; do
+            [ -n "$id" ] || continue
+            created="$(date -u -d "$created_at" +%s)"
+            if [ "$created" -lt "$cutoff" ]; then
+              total=$((total + size))
+              count=$((count + 1))
+              echo "artifact $id $name $created_at $size bytes"
+              if [ "$DRY_RUN" != "true" ]; then
+                gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" >/dev/null
+              fi
+            fi
+          done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | [.id, .name, .created_at, .size_in_bytes] | @tsv')
+
+          echo "Artifacts matched: $count"
+          echo "Artifact bytes matched: $total"
+
+      - name: Prune old caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          cutoff="$(date -u -d "$CACHE_DAYS days ago" +%s)"
+          total=0
+          count=0
+
+          while IFS=$'\t' read -r id key last_accessed_at size; do
+            [ -n "$id" ] || continue
+            last_accessed="$(date -u -d "$last_accessed_at" +%s)"
+            if [ "$last_accessed" -lt "$cutoff" ]; then
+              total=$((total + size))
+              count=$((count + 1))
+              echo "cache $id $key $last_accessed_at $size bytes"
+              if [ "$DRY_RUN" != "true" ]; then
+                gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" >/dev/null
+              fi
+            fi
+          done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" \
+            --jq '.actions_caches[] | [.id, .key, .last_accessed_at, .size_in_bytes] | @tsv')
+
+          echo "Caches matched: $count"
+          echo "Cache bytes matched: $total"
