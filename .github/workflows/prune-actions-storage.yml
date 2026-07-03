@@ -3,14 +3,23 @@ name: Prune Actions Storage
 on:
   workflow_dispatch:
     inputs:
-      artifacts_older_than_days:
-        description: "Delete artifacts older than this many days"
+      keep_artifacts_per_name:
+        description: "Keep this many newest artifacts for each artifact name"
         required: true
-        default: "3"
-      caches_older_than_days:
-        description: "Delete caches older than this many days"
+        default: "10"
+      keep_caches_per_group:
+        description: "Keep this many newest caches for each cache key group"
         required: true
-        default: "7"
+        default: "10"
+      keep_releases_per_type:
+        description: "Keep this many newest releases for each release type"
+        required: true
+        default: "10"
+      delete_release_tags:
+        description: "Delete the git tag when deleting a release"
+        required: true
+        default: true
+        type: boolean
       dry_run:
         description: "Preview only; do not delete"
         required: true
@@ -19,31 +28,33 @@ on:
 
 permissions:
   actions: write
-  contents: read
+  contents: write
 
 jobs:
   prune:
-    name: Delete old artifacts and caches
+    name: Keep newest artifacts, caches, and releases
     runs-on: ubuntu-latest
     env:
-      ARTIFACT_DAYS: ${{ inputs.artifacts_older_than_days }}
-      CACHE_DAYS: ${{ inputs.caches_older_than_days }}
+      KEEP_ARTIFACTS: ${{ inputs.keep_artifacts_per_name }}
+      KEEP_CACHES: ${{ inputs.keep_caches_per_group }}
+      KEEP_RELEASES: ${{ inputs.keep_releases_per_type }}
+      DELETE_RELEASE_TAGS: ${{ inputs.delete_release_tags }}
       DRY_RUN: ${{ inputs.dry_run }}
       GH_TOKEN: ${{ github.token }}
 
     steps:
-      - name: Prune old artifacts
+      - name: Prune artifacts by name
         shell: bash
         run: |
           set -euo pipefail
-          cutoff="$(date -u -d "$ARTIFACT_DAYS days ago" +%s)"
           total=0
           count=0
+          declare -A seen
 
-          while IFS=$'\t' read -r id name created_at size; do
+          while IFS=$'\t' read -r name created_at id size; do
             [ -n "$id" ] || continue
-            created="$(date -u -d "$created_at" +%s)"
-            if [ "$created" -lt "$cutoff" ]; then
+            seen["$name"]=$(( ${seen["$name"]:-0} + 1 ))
+            if [ "${seen["$name"]}" -gt "$KEEP_ARTIFACTS" ]; then
               total=$((total + size))
               count=$((count + 1))
               echo "artifact $id $name $created_at $size bytes"
@@ -52,32 +63,86 @@ jobs:
               fi
             fi
           done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
-            --jq '.artifacts[] | [.id, .name, .created_at, .size_in_bytes] | @tsv')
+            --jq '.artifacts[] | [.name, .created_at, .id, .size_in_bytes] | @tsv' \
+            | sort -t$'\t' -k1,1 -k2,2r)
 
-          echo "Artifacts matched: $count"
+          echo "Artifacts beyond newest $KEEP_ARTIFACTS per name: $count"
           echo "Artifact bytes matched: $total"
 
-      - name: Prune old caches
+      - name: Prune caches by key group
         shell: bash
         run: |
           set -euo pipefail
-          cutoff="$(date -u -d "$CACHE_DAYS days ago" +%s)"
           total=0
           count=0
+          declare -A seen
 
-          while IFS=$'\t' read -r id key last_accessed_at size; do
+          cache_group() {
+            local key="$1"
+            local tail="${key##*-}"
+            if [[ "$tail" =~ ^[0-9a-fA-F]{16,}$ ]]; then
+              printf '%s\n' "${key%-*}"
+            else
+              printf '%s\n' "$key"
+            fi
+          }
+
+          while IFS=$'\t' read -r key last_accessed_at id size; do
             [ -n "$id" ] || continue
-            last_accessed="$(date -u -d "$last_accessed_at" +%s)"
-            if [ "$last_accessed" -lt "$cutoff" ]; then
+            group="$(cache_group "$key")"
+            seen["$group"]=$(( ${seen["$group"]:-0} + 1 ))
+            if [ "${seen["$group"]}" -gt "$KEEP_CACHES" ]; then
               total=$((total + size))
               count=$((count + 1))
-              echo "cache $id $key $last_accessed_at $size bytes"
+              echo "cache $id $group $key $last_accessed_at $size bytes"
               if [ "$DRY_RUN" != "true" ]; then
                 gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" >/dev/null
               fi
             fi
           done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" \
-            --jq '.actions_caches[] | [.id, .key, .last_accessed_at, .size_in_bytes] | @tsv')
+            --jq '.actions_caches[] | [.key, .last_accessed_at, .id, .size_in_bytes] | @tsv' \
+            | sort -t$'\t' -k2,2r)
 
-          echo "Caches matched: $count"
+          echo "Caches beyond newest $KEEP_CACHES per key group: $count"
           echo "Cache bytes matched: $total"
+
+      - name: Prune releases by type
+        shell: bash
+        run: |
+          set -euo pipefail
+          total=0
+          count=0
+          declare -A seen
+
+          release_group() {
+            local tag="$1"
+            if [[ "$tag" == vfast-* ]]; then
+              printf '%s\n' "fast"
+            elif [[ "$tag" == v* ]]; then
+              printf '%s\n' "standard"
+            else
+              printf '%s\n' "other"
+            fi
+          }
+
+          while IFS=$'\t' read -r tag created_at id size; do
+            [ -n "$id" ] || continue
+            group="$(release_group "$tag")"
+            seen["$group"]=$(( ${seen["$group"]:-0} + 1 ))
+            if [ "${seen["$group"]}" -gt "$KEEP_RELEASES" ]; then
+              total=$((total + size))
+              count=$((count + 1))
+              echo "release $id $group $tag $created_at $size bytes"
+              if [ "$DRY_RUN" != "true" ]; then
+                gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$id" >/dev/null
+                if [ "$DELETE_RELEASE_TAGS" = "true" ]; then
+                  gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" >/dev/null || true
+                fi
+              fi
+            fi
+          done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | [.tag_name, .created_at, .id, (.assets | map(.size) | add // 0)] | @tsv' \
+            | sort -t$'\t' -k2,2r)
+
+          echo "Releases beyond newest $KEEP_RELEASES per type: $count"
+          echo "Release asset bytes matched: $total"
