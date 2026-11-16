@@ -65,8 +65,7 @@ StlMouth(2,1);
 StlEyeOpenLevel(2,5,1);
 StlCheek(2,10);
 VoicePlay("B050200200_02_070");
-MsgDisp("Sassa","That's crazy, though.
-...You all covered in...steam.");
+MsgDisp("Sassa","That's crazy, though.\n...You're all covered in...steam.");
 MsgDisp("主人公","Eh... EH∋
 That's kind of embarrassing...");
 StlEye(2,1);
